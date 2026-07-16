@@ -1,12 +1,18 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 import asyncio
-from datetime import datetime
-import os
+import calendar
+from datetime import date
+import httpx
 
-app = FastAPI(title="Travel2Go API - Complete Search")
+from data.destinations import DESTINATIONS, localize
+from providers.flights import fetch_flight
+from providers.hotels import fetch_hotels
+from providers.ground import get_ground_transport
+
+app = FastAPI(title="Travel2Go API - Europe", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,196 +22,168 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================================
+# ============================================================
 # MODELS
-# ============================================================================
+# ============================================================
 
 class SearchFilters(BaseModel):
-    maxStops: int = -1             # -1 = peu importe, 0 = direct, 1 = 1 escale, 2 = 2 escales
-    maxFlightDuration: int = -1    # en heures, -1 = peu importe
-    baggageIncluded: bool = False
-    minHotelRating: int = 0        # 0 = toutes, 3, 4, 5
-    accommodationType: str = "all" # "all", "hotel", "hostel", "apartment"
+    transportModes: List[str] = ["flight", "train", "bus"]
+    maxStops: int = -1          # vols : -1 = peu importe
+    maxTravelHours: int = -1    # tous modes : -1 = peu importe
+    minHotelRating: int = 0     # 0 = toutes, sinon 3/4/5 étoiles
 
 class SearchRequest(BaseModel):
-    origin: str
-    budget: float
-    period: str
-    nights: int = 7
-    filters: SearchFilters = SearchFilters()
+    origin: str                 # code ville IATA, ex. "BCN"
+    budget: float               # budget total EUR
+    month: str                  # "YYYY-MM"
+    nights: int = 5
+    lang: str = "fr"            # fr | en | es
+    filters: SearchFilters = Field(default_factory=SearchFilters)
 
-class FlightInfo(BaseModel):
+class TransportInfo(BaseModel):
+    mode: str
     price: float
     duration_hours: Optional[float] = None
-    stops: int
-    airline: Optional[str] = None
-    has_baggage: bool
-    affiliate_url: str
+    stops: Optional[int] = 0
+    carrier: Optional[str] = None
+    booking_url: str
 
 class HotelInfo(BaseModel):
     name: str
     price_per_night: float
     total_price: float
     rating: float
-    accommodation_type: str  # "hotel", "hostel", "apartment"
-    affiliate_url: str
+    booking_url: str
 
 class TravelPackage(BaseModel):
     destination: str
     country: str
     code: str
     flag: str
-    flight: FlightInfo
+    transport: TransportInfo
     hotel: HotelInfo
     total_cost: float
     budget_remaining: float
     savings_pct: float
 
-# ============================================================================
-# DESTINATIONS (toutes)
-# ============================================================================
+# ============================================================
+# HELPERS
+# ============================================================
 
-ALL_DESTINATIONS = [
-    # Europe
-    'BCN', 'LIS', 'MAD', 'FCO', 'CDG', 'LHR', 'DUB', 'AMS', 'BER', 'PRG',
-    'ATH', 'VIE', 'BUD', 'WAW', 'CPH', 'OSL', 'STO', 'HEL', 'ZRH', 'MUC',
-    'BRU', 'VCE', 'NAP', 'MXP', 'OPO',
-    # Amérique
-    'MEX', 'BOG', 'LIM', 'GRU', 'EZE', 'SCL', 'PTY', 'CUN', 'GDL', 'MDE',
-    # Asie
-    'NRT', 'ICN', 'BKK', 'SIN', 'HKG', 'DEL', 'BOM', 'DXB'
-]
+def dates_from_month(month: str, nights: int):
+    """'2026-09' -> (check-in le 10, check-out 10+nights)."""
+    try:
+        y, m = (int(x) for x in month.split("-"))
+        start = date(y, m, 10)
+        last_day = calendar.monthrange(y, m)[1]
+        end_day = min(10 + nights, last_day)
+        end = date(y, m, end_day)
+        return start.isoformat(), end.isoformat()
+    except Exception:
+        raise HTTPException(400, "month doit être au format YYYY-MM")
 
-# ============================================================================
-# MAIN SEARCH
-# ============================================================================
+def pick_best_transport(options: list, max_stops: int, max_hours: int):
+    valid = []
+    for o in options:
+        if o is None:
+            continue
+        if o["mode"] == "flight":
+            if max_stops != -1 and (o.get("stops") or 0) > max_stops:
+                continue
+            if max_hours != -1 and o.get("duration_hours") \
+               and o["duration_hours"] > max_hours:
+                continue
+        valid.append(o)
+    return min(valid, key=lambda x: x["price"]) if valid else None
+
+# ============================================================
+# SEARCH
+# ============================================================
 
 @app.post("/search/packages", response_model=List[TravelPackage])
-async def search_packages(request: SearchRequest):
-    """
-    Recherche complète avec tous les filtres
-    """
-    start_time = datetime.now()
-    
-    print(f"🔍 COMPLETE SEARCH")
-    print(f"   Origin: {request.origin}")
-    print(f"   Budget: {request.budget} CAD")
-    print(f"   Period: {request.period}")
-    print(f"   Nights: {request.nights}")
-    print(f"   Filters:")
-    print(f"     - Max stops: {request.filters.maxStops}")
-    print(f"     - Max duration: {request.filters.maxFlightDuration}h")
-    print(f"     - Baggage: {request.filters.baggageIncluded}")
-    print(f"     - Min hotel rating: {request.filters.minHotelRating}★")
-    print(f"     - Accommodation: {request.filters.accommodationType}")
-    
-    try:
-        from scrapers.flights_multi import scrape_flights_multi
-        from scrapers.hotels_booking import scrape_hotels_booking
-        
-        # 1. Scraper les vols avec filtres
-        max_flight_budget = request.budget * 0.5  # 50% du budget pour le vol
-        
-        flights = await scrape_flights_multi(
-            origin=request.origin,
-            max_budget=max_flight_budget,
-            period=request.period,
-            destinations=ALL_DESTINATIONS,
-            max_stops=request.filters.maxStops,
-            max_duration=request.filters.maxFlightDuration,
-            baggage_included=request.filters.baggageIncluded
-        )
-        
-        print(f"✅ Found {len(flights)} matching flights")
-        
-        if not flights:
-            return []
-        
-        # 2. Pour chaque vol, chercher des hôtels avec filtres
+async def search_packages(req: SearchRequest):
+    origin = req.origin.upper()
+    if origin not in DESTINATIONS:
+        raise HTTPException(400, f"Origine inconnue: {origin}")
+
+    modes = req.filters.transportModes
+    max_transport_budget = req.budget * 0.5
+    checkin, checkout = dates_from_month(req.month, req.nights)
+    dests = [c for c in DESTINATIONS if c != origin]
+
+    async with httpx.AsyncClient() as client:
+        # 1. Vols (concurrent) si mode activé
+        flight_results = {}
+        if "flight" in modes:
+            tasks = [fetch_flight(client, origin, d, req.month) for d in dests]
+            for d, res in zip(dests, await asyncio.gather(*tasks)):
+                flight_results[d] = res
+
+        # 2. Meilleur transport par destination (vol vs train vs bus)
+        transport_by_dest = {}
+        for d in dests:
+            options = []
+            if flight_results.get(d):
+                options.append(flight_results[d])
+            options += get_ground_transport(
+                origin, d, modes, req.filters.maxTravelHours
+            )
+            best = pick_best_transport(
+                options, req.filters.maxStops, req.filters.maxTravelHours
+            )
+            if best and best["price"] <= max_transport_budget:
+                transport_by_dest[d] = best
+
+        # 3. Hôtels pour les destinations retenues (concurrent)
         packages = []
-        
-        for flight in flights[:20]:  # Limiter à 20 vols pour éviter timeout
-            try:
-                remaining_budget = request.budget - flight["price"]
-                max_hotel_per_night = remaining_budget / request.nights
-                
-                hotels = await scrape_hotels_booking(
-                    city_code=flight["code"],
-                    max_price_per_night=max_hotel_per_night,
-                    nights=request.nights,
-                    period=request.period,
-                    min_rating=request.filters.minHotelRating,
-                    accommodation_type=request.filters.accommodationType
-                )
-                
-                if not hotels:
-                    continue
-                
-                # Prendre le meilleur hôtel (meilleur rapport qualité/prix)
-                best_hotel = hotels[0]
-                
-                total_hotel_cost = best_hotel["price_per_night"] * request.nights
-                total_package_cost = flight["price"] + total_hotel_cost
-                budget_remaining = request.budget - total_package_cost
-                savings_pct = (budget_remaining / request.budget) * 100
-                
-                package = TravelPackage(
-                    destination=flight["city"],
-                    country=flight["country"],
-                    code=flight["code"],
-                    flag=flight["flag"],
-                    flight=FlightInfo(
-                        price=flight["price"],
-                        duration_hours=flight.get("duration_hours"),
-                        stops=flight["stops"],
-                        airline=flight.get("airline"),
-                        has_baggage=flight["has_baggage"],
-                        affiliate_url=flight["affiliate_url"]
-                    ),
-                    hotel=HotelInfo(
-                        name=best_hotel["name"],
-                        price_per_night=best_hotel["price_per_night"],
-                        total_price=total_hotel_cost,
-                        rating=best_hotel["rating"],
-                        accommodation_type=best_hotel["accommodation_type"],
-                        affiliate_url=best_hotel["affiliate_url"]
-                    ),
-                    total_cost=total_package_cost,
-                    budget_remaining=budget_remaining,
-                    savings_pct=savings_pct
-                )
-                
-                packages.append(package)
-                
-            except Exception as e:
-                print(f"Error processing {flight['code']}: {e}")
-                continue
-        
-        # Trier par budget restant (le plus économique en premier)
-        packages.sort(key=lambda x: x.budget_remaining, reverse=True)
-        
-        search_time = (datetime.now() - start_time).total_seconds()
-        print(f"✅ Found {len(packages)} complete packages in {search_time:.1f}s")
-        
-        return packages
-        
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        hotel_tasks = {}
+        for d, t in transport_by_dest.items():
+            remaining = req.budget - t["price"]
+            per_night = remaining / max(req.nights, 1)
+            hotel_tasks[d] = fetch_hotels(
+                client, DESTINATIONS[d]["names"]["en"],
+                checkin, checkout, req.nights,
+                per_night, req.filters.minHotelRating,
+            )
+        hotel_results = dict(zip(
+            hotel_tasks.keys(),
+            await asyncio.gather(*hotel_tasks.values())
+        ))
+
+    # 4. Assembler les packages
+    for d, t in transport_by_dest.items():
+        hotels = hotel_results.get(d, [])
+        if not hotels:
+            continue
+        h = hotels[0]
+        total = t["price"] + h["total_price"]
+        if total > req.budget:
+            continue
+        loc = localize(d, req.lang)
+        packages.append(TravelPackage(
+            destination=loc["name"],
+            country=loc["country"],
+            code=d,
+            flag=loc["flag"],
+            transport=TransportInfo(**t),
+            hotel=HotelInfo(**h),
+            total_cost=round(total, 2),
+            budget_remaining=round(req.budget - total, 2),
+            savings_pct=round((req.budget - total) / req.budget * 100, 1),
+        ))
+
+    packages.sort(key=lambda p: -p.budget_remaining)
+    return packages
+
+@app.get("/destinations")
+async def list_destinations(lang: str = "fr"):
+    return [localize(c, lang) for c in DESTINATIONS]
 
 @app.get("/")
 async def root():
     return {
-        "service": "Travel2Go API",
-        "version": "3.0.0",
-        "mode": "complete_search_with_filters",
-        "status": "running"
+        "service": "Travel2Go API - Europe",
+        "version": "4.0.0",
+        "langs": ["fr", "en", "es"],
+        "transport_modes": ["flight", "train", "bus"],
     }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
