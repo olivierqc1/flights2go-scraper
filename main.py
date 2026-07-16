@@ -9,10 +9,10 @@ import httpx
 
 from data.destinations import DESTINATIONS, localize
 from providers.flights import fetch_flight
-from providers.hotels import fetch_hotels
+from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.0.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +30,7 @@ class SearchFilters(BaseModel):
     transportModes: List[str] = ["flight", "train", "bus"]
     maxStops: int = -1          # vols : -1 = peu importe
     maxTravelHours: int = -1    # tous modes : -1 = peu importe
-    minHotelRating: int = 0     # 0 = toutes, sinon 3/4/5 étoiles
+    minHotelRating: int = 0     # conservé pour compat, non utilisé
 
 class SearchRequest(BaseModel):
     origin: str                 # code ville IATA, ex. "BCN"
@@ -119,46 +119,32 @@ async def search_packages(req: SearchRequest):
             for d, res in zip(dests, await asyncio.gather(*tasks)):
                 flight_results[d] = res
 
-        # 2. Meilleur transport par destination (vol vs train vs bus)
-        transport_by_dest = {}
-        for d in dests:
-            options = []
-            if flight_results.get(d):
-                options.append(flight_results[d])
-            options += get_ground_transport(
-                origin, d, modes, req.filters.maxTravelHours
-            )
-            best = pick_best_transport(
-                options, req.filters.maxStops, req.filters.maxTravelHours
-            )
-            if best and best["price"] <= max_transport_budget:
-                transport_by_dest[d] = best
+    # 2. Meilleur transport par destination (vol vs train vs bus)
+    transport_by_dest = {}
+    for d in dests:
+        options = []
+        if flight_results.get(d):
+            options.append(flight_results[d])
+        options += get_ground_transport(
+            origin, d, modes, req.filters.maxTravelHours
+        )
+        best = pick_best_transport(
+            options, req.filters.maxStops, req.filters.maxTravelHours
+        )
+        if best and best["price"] <= max_transport_budget:
+            transport_by_dest[d] = best
 
-        # 3. Hôtels pour les destinations retenues (concurrent)
-        packages = []
-        hotel_tasks = {}
-        for d, t in transport_by_dest.items():
-            remaining = req.budget - t["price"]
-            per_night = remaining / max(req.nights, 1)
-            hotel_tasks[d] = fetch_hotels(
-                client, DESTINATIONS[d]["names"]["en"],
-                checkin, checkout, req.nights,
-                per_night, req.filters.minHotelRating,
-            )
-        hotel_results = dict(zip(
-            hotel_tasks.keys(),
-            await asyncio.gather(*hotel_tasks.values())
-        ))
-
-    # 4. Assembler les packages
+    # 3. Assembler les packages avec budget hôtel + deeplink
+    packages = []
     for d, t in transport_by_dest.items():
-        hotels = hotel_results.get(d, [])
-        if not hotels:
-            continue
-        h = hotels[0]
-        total = t["price"] + h["total_price"]
-        if total > req.budget:
-            continue
+        remaining = req.budget - t["price"]
+        hotel = build_hotel_option(
+            DESTINATIONS[d]["names"]["en"],
+            checkin, checkout, req.nights, remaining, req.lang,
+        )
+        if hotel is None:
+            continue  # budget/nuit trop bas pour être réaliste
+        total = t["price"] + hotel["total_price"]
         loc = localize(d, req.lang)
         packages.append(TravelPackage(
             destination=loc["name"],
@@ -166,13 +152,14 @@ async def search_packages(req: SearchRequest):
             code=d,
             flag=loc["flag"],
             transport=TransportInfo(**t),
-            hotel=HotelInfo(**h),
+            hotel=HotelInfo(**hotel),
             total_cost=round(total, 2),
             budget_remaining=round(req.budget - total, 2),
-            savings_pct=round((req.budget - total) / req.budget * 100, 1),
+            savings_pct=0.0,
         ))
 
-    packages.sort(key=lambda p: -p.budget_remaining)
+    # Trier : transport le moins cher d'abord = plus de budget hôtel
+    packages.sort(key=lambda p: p.transport.price)
     return packages
 
 @app.get("/destinations")
@@ -183,7 +170,7 @@ async def list_destinations(lang: str = "fr"):
 async def root():
     return {
         "service": "Travel2Go API - Europe",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "langs": ["fr", "en", "es"],
         "transport_modes": ["flight", "train", "bus"],
     }
