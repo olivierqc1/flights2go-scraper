@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 import asyncio
 import calendar
-from datetime import date
+from datetime import date, timedelta
 import httpx
 
 from data.destinations import DESTINATIONS, localize
@@ -12,7 +12,7 @@ from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.4.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,19 +35,21 @@ class SearchFilters(BaseModel):
 
 class SearchRequest(BaseModel):
     origin: str
-    budget: float               # budget total pour TOUT le groupe
+    budget: float               # budget total du groupe
     month: str
     nights: int = 5
     travelers: int = 1
+    tripType: str = "month"     # month | weekend
     lang: str = "fr"
     filters: SearchFilters = Field(default_factory=SearchFilters)
 
 class TransportInfo(BaseModel):
     mode: str
-    price: float                # prix pour tout le groupe
+    price: float
     duration_hours: Optional[float] = None
     stops: Optional[int] = 0
     carrier: Optional[str] = None
+    departure_date: Optional[str] = None
     booking_url: str
 
 class HotelInfo(BaseModel):
@@ -68,16 +70,16 @@ class TravelPackage(BaseModel):
     budget_remaining: float
     savings_pct: float
 
-def dates_from_month(month: str, nights: int):
+def default_checkin(month: str) -> str:
     try:
         y, m = (int(x) for x in month.split("-"))
-        start = date(y, m, 10)
-        last_day = calendar.monthrange(y, m)[1]
-        end_day = min(10 + nights, last_day)
-        end = date(y, m, end_day)
-        return start.isoformat(), end.isoformat()
+        return date(y, m, 10).isoformat()
     except Exception:
         raise HTTPException(400, "month doit être au format YYYY-MM")
+
+def stay_dates(checkin_str: str, nights: int):
+    d0 = date.fromisoformat(checkin_str)
+    return checkin_str, (d0 + timedelta(days=max(nights, 1))).isoformat()
 
 def is_excluded(code: str, excluded: List[str]) -> bool:
     if not excluded:
@@ -109,8 +111,10 @@ async def search_packages(req: SearchRequest):
     modes = f.transportModes
     bags = max(0, min(f.bags, 2))
     trav = max(1, min(req.travelers, 8))
+    weekend = req.tripType == "weekend"
+    nights = min(req.nights, 3) if weekend else req.nights
     max_transport_budget = req.budget * 0.5
-    checkin, checkout = dates_from_month(req.month, req.nights)
+    base_checkin = default_checkin(req.month)
 
     dests = [
         c for c in DESTINATIONS
@@ -120,7 +124,10 @@ async def search_packages(req: SearchRequest):
     async with httpx.AsyncClient() as client:
         flight_results = {}
         if "flight" in modes:
-            tasks = [fetch_flight(client, origin, d, req.month) for d in dests]
+            tasks = [
+                fetch_flight(client, origin, d, req.month, weekend)
+                for d in dests
+            ]
             for d, res in zip(dests, await asyncio.gather(*tasks)):
                 flight_results[d] = res
 
@@ -130,7 +137,6 @@ async def search_packages(req: SearchRequest):
         fl = flight_results.get(d)
         if fl:
             fl = dict(fl)
-            # prix par personne + valises -> groupe
             fl["price"] = (fl["price"] + bags * BAG_FEE_PER_TRIP * 2) * trav
             options.append(fl)
         for g in get_ground_transport(origin, d, modes, f.maxTravelHours):
@@ -143,10 +149,13 @@ async def search_packages(req: SearchRequest):
 
     packages = []
     for d, t in transport_by_dest.items():
+        checkin, checkout = stay_dates(
+            t.get("departure_date") or base_checkin, nights
+        )
         remaining = req.budget - t["price"]
         hotel = build_hotel_option(
             DESTINATIONS[d]["names"]["en"],
-            checkin, checkout, req.nights, remaining,
+            checkin, checkout, nights, remaining,
             req.lang, f.accommodationType, trav,
         )
         if hotel is None:
@@ -177,4 +186,4 @@ async def list_destinations(lang: str = "fr"):
 
 @app.get("/")
 async def root():
-    return {"service": "Travel2Go API - Europe", "version": "4.4.0"}
+    return {"service": "Travel2Go API - Europe", "version": "4.5.0"}
