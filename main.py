@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import asyncio
-import calendar
 from datetime import date, timedelta
 import httpx
 
@@ -11,8 +10,9 @@ from data.destinations import DESTINATIONS, localize
 from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
+from providers.currency import get_rates, normalize
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.5.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +35,8 @@ class SearchFilters(BaseModel):
 
 class SearchRequest(BaseModel):
     origin: str
-    budget: float               # budget total du groupe
+    budget: float               # dans la devise choisie
+    currency: str = "EUR"
     month: str
     nights: int = 5
     travelers: int = 1
@@ -58,12 +59,14 @@ class HotelInfo(BaseModel):
     total_price: float
     rating: float
     booking_url: str
+    alt_booking_url: Optional[str] = None
 
 class TravelPackage(BaseModel):
     destination: str
     country: str
     code: str
     flag: str
+    currency: str
     transport: TransportInfo
     hotel: HotelInfo
     total_cost: float
@@ -113,7 +116,13 @@ async def search_packages(req: SearchRequest):
     trav = max(1, min(req.travelers, 8))
     weekend = req.tripType == "weekend"
     nights = min(req.nights, 3) if weekend else req.nights
-    max_transport_budget = req.budget * 0.5
+
+    cur = normalize(req.currency)
+    rates = await get_rates()
+    rate = rates.get(cur, 1.0)
+    budget_eur = req.budget / rate if rate else req.budget
+
+    max_transport_budget = budget_eur * 0.5
     base_checkin = default_checkin(req.month)
 
     dests = [
@@ -147,12 +156,14 @@ async def search_packages(req: SearchRequest):
         if best and best["price"] <= max_transport_budget:
             transport_by_dest[d] = best
 
+    cv = lambda x: round(x * rate, 2)  # EUR -> devise choisie
+
     packages = []
     for d, t in transport_by_dest.items():
         checkin, checkout = stay_dates(
             t.get("departure_date") or base_checkin, nights
         )
-        remaining = req.budget - t["price"]
+        remaining = budget_eur - t["price"]
         hotel = build_hotel_option(
             DESTINATIONS[d]["names"]["en"],
             checkin, checkout, nights, remaining,
@@ -161,20 +172,26 @@ async def search_packages(req: SearchRequest):
         if hotel is None:
             continue
         total = t["price"] + hotel["total_price"]
-        left = req.budget - total
+        left = budget_eur - total
         if left < 0:
             continue
         loc = localize(d, req.lang)
+        t_out = dict(t)
+        t_out["price"] = cv(t["price"])
+        h_out = dict(hotel)
+        h_out["price_per_night"] = cv(hotel["price_per_night"])
+        h_out["total_price"] = cv(hotel["total_price"])
         packages.append(TravelPackage(
             destination=loc["name"],
             country=loc["country"],
             code=d,
             flag=loc["flag"],
-            transport=TransportInfo(**t),
-            hotel=HotelInfo(**hotel),
-            total_cost=round(total, 2),
-            budget_remaining=round(left, 2),
-            savings_pct=round(left / req.budget * 100, 1),
+            currency=cur,
+            transport=TransportInfo(**t_out),
+            hotel=HotelInfo(**h_out),
+            total_cost=cv(total),
+            budget_remaining=cv(left),
+            savings_pct=round(left / budget_eur * 100, 1),
         ))
 
     packages.sort(key=lambda p: -p.budget_remaining)
@@ -186,4 +203,4 @@ async def list_destinations(lang: str = "fr"):
 
 @app.get("/")
 async def root():
-    return {"service": "Travel2Go API - Europe", "version": "4.5.0"}
+    return {"service": "Travel2Go API - Europe", "version": "4.6.0"}
