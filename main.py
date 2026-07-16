@@ -12,7 +12,7 @@ from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.1.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,16 +28,16 @@ app.add_middleware(
 
 class SearchFilters(BaseModel):
     transportModes: List[str] = ["flight", "train", "bus"]
-    maxStops: int = -1          # vols : -1 = peu importe
-    maxTravelHours: int = -1    # tous modes : -1 = peu importe
+    maxStops: int = -1
+    maxTravelHours: int = -1
     minHotelRating: int = 0     # conservé pour compat, non utilisé
 
 class SearchRequest(BaseModel):
-    origin: str                 # code ville IATA, ex. "BCN"
-    budget: float               # budget total EUR
+    origin: str
+    budget: float
     month: str                  # "YYYY-MM"
     nights: int = 5
-    lang: str = "fr"            # fr | en | es
+    lang: str = "fr"
     filters: SearchFilters = Field(default_factory=SearchFilters)
 
 class TransportInfo(BaseModel):
@@ -71,7 +71,6 @@ class TravelPackage(BaseModel):
 # ============================================================
 
 def dates_from_month(month: str, nights: int):
-    """'2026-09' -> (check-in le 10, check-out 10+nights)."""
     try:
         y, m = (int(x) for x in month.split("-"))
         start = date(y, m, 10)
@@ -112,14 +111,12 @@ async def search_packages(req: SearchRequest):
     dests = [c for c in DESTINATIONS if c != origin]
 
     async with httpx.AsyncClient() as client:
-        # 1. Vols (concurrent) si mode activé
         flight_results = {}
         if "flight" in modes:
             tasks = [fetch_flight(client, origin, d, req.month) for d in dests]
             for d, res in zip(dests, await asyncio.gather(*tasks)):
                 flight_results[d] = res
 
-    # 2. Meilleur transport par destination (vol vs train vs bus)
     transport_by_dest = {}
     for d in dests:
         options = []
@@ -134,7 +131,6 @@ async def search_packages(req: SearchRequest):
         if best and best["price"] <= max_transport_budget:
             transport_by_dest[d] = best
 
-    # 3. Assembler les packages avec budget hôtel + deeplink
     packages = []
     for d, t in transport_by_dest.items():
         remaining = req.budget - t["price"]
@@ -143,8 +139,12 @@ async def search_packages(req: SearchRequest):
             checkin, checkout, req.nights, remaining, req.lang,
         )
         if hotel is None:
-            continue  # budget/nuit trop bas pour être réaliste
+            continue
+        # Total réaliste : transport + estimation hôtel × nuits
         total = t["price"] + hotel["total_price"]
+        left = req.budget - total
+        if left < 0:
+            continue
         loc = localize(d, req.lang)
         packages.append(TravelPackage(
             destination=loc["name"],
@@ -154,12 +154,12 @@ async def search_packages(req: SearchRequest):
             transport=TransportInfo(**t),
             hotel=HotelInfo(**hotel),
             total_cost=round(total, 2),
-            budget_remaining=round(req.budget - total, 2),
-            savings_pct=0.0,
+            budget_remaining=round(left, 2),
+            savings_pct=round(left / req.budget * 100, 1),
         ))
 
-    # Trier : transport le moins cher d'abord = plus de budget hôtel
-    packages.sort(key=lambda p: p.transport.price)
+    # Le plus de budget restant en premier
+    packages.sort(key=lambda p: -p.budget_remaining)
     return packages
 
 @app.get("/destinations")
@@ -170,7 +170,7 @@ async def list_destinations(lang: str = "fr"):
 async def root():
     return {
         "service": "Travel2Go API - Europe",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "langs": ["fr", "en", "es"],
         "transport_modes": ["flight", "train", "bus"],
     }
