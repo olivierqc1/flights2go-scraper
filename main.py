@@ -12,7 +12,7 @@ from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.3.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,32 +22,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BAG_FEE_PER_TRIP = 30.0  # estimation valise soute, par trajet (avion seulement)
-
-# ============================================================
-# MODELS
-# ============================================================
+BAG_FEE_PER_TRIP = 30.0
 
 class SearchFilters(BaseModel):
     transportModes: List[str] = ["flight", "train", "bus"]
     maxStops: int = -1
     maxTravelHours: int = -1
-    bags: int = 0                    # valises soute (0-2)
-    accommodationType: str = "hotel" # hotel | hostel | any
-    excludeCountries: List[str] = [] # noms de pays (toute langue)
-    minHotelRating: int = 0          # compat, non utilisé
+    bags: int = 0
+    accommodationType: str = "hotel"
+    excludeCountries: List[str] = []
+    minHotelRating: int = 0
 
 class SearchRequest(BaseModel):
     origin: str
-    budget: float
-    month: str                  # "YYYY-MM"
+    budget: float               # budget total pour TOUT le groupe
+    month: str
     nights: int = 5
+    travelers: int = 1
     lang: str = "fr"
     filters: SearchFilters = Field(default_factory=SearchFilters)
 
 class TransportInfo(BaseModel):
     mode: str
-    price: float
+    price: float                # prix pour tout le groupe
     duration_hours: Optional[float] = None
     stops: Optional[int] = 0
     carrier: Optional[str] = None
@@ -70,10 +67,6 @@ class TravelPackage(BaseModel):
     total_cost: float
     budget_remaining: float
     savings_pct: float
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def dates_from_month(month: str, nights: int):
     try:
@@ -106,10 +99,6 @@ def pick_best_transport(options: list, max_stops: int, max_hours: int):
         valid.append(o)
     return min(valid, key=lambda x: x["price"]) if valid else None
 
-# ============================================================
-# SEARCH
-# ============================================================
-
 @app.post("/search/packages", response_model=List[TravelPackage])
 async def search_packages(req: SearchRequest):
     origin = req.origin.upper()
@@ -119,6 +108,7 @@ async def search_packages(req: SearchRequest):
     f = req.filters
     modes = f.transportModes
     bags = max(0, min(f.bags, 2))
+    trav = max(1, min(req.travelers, 8))
     max_transport_budget = req.budget * 0.5
     checkin, checkout = dates_from_month(req.month, req.nights)
 
@@ -140,9 +130,13 @@ async def search_packages(req: SearchRequest):
         fl = flight_results.get(d)
         if fl:
             fl = dict(fl)
-            fl["price"] = fl["price"] + bags * BAG_FEE_PER_TRIP * 2  # A/R
+            # prix par personne + valises -> groupe
+            fl["price"] = (fl["price"] + bags * BAG_FEE_PER_TRIP * 2) * trav
             options.append(fl)
-        options += get_ground_transport(origin, d, modes, f.maxTravelHours)
+        for g in get_ground_transport(origin, d, modes, f.maxTravelHours):
+            g = dict(g)
+            g["price"] = g["price"] * trav
+            options.append(g)
         best = pick_best_transport(options, f.maxStops, f.maxTravelHours)
         if best and best["price"] <= max_transport_budget:
             transport_by_dest[d] = best
@@ -153,7 +147,7 @@ async def search_packages(req: SearchRequest):
         hotel = build_hotel_option(
             DESTINATIONS[d]["names"]["en"],
             checkin, checkout, req.nights, remaining,
-            req.lang, f.accommodationType,
+            req.lang, f.accommodationType, trav,
         )
         if hotel is None:
             continue
@@ -183,9 +177,4 @@ async def list_destinations(lang: str = "fr"):
 
 @app.get("/")
 async def root():
-    return {
-        "service": "Travel2Go API - Europe",
-        "version": "4.3.0",
-        "langs": ["fr", "en", "es"],
-        "transport_modes": ["flight", "train", "bus"],
-    }
+    return {"service": "Travel2Go API - Europe", "version": "4.4.0"}
