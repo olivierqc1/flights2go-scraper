@@ -1,17 +1,32 @@
 # Hébergement : estimation basée sur le budget + deeplinks.
-# Hotellook toujours, Hostelworld en plus pour les auberges.
-# Env vars : TP_MARKER, HW_PREFIX (optionnel, wrapper affilié Hostelworld)
+# Hotellook est MORT (fermé oct. 2025) -> cible Trip.com,
+# avec wrapper affilié Travelpayouts optionnel (tp.media).
+# Hostelworld pour les auberges.
+# Env vars :
+#   HOTEL_AFF_PREFIX : wrapper tp.media complet finissant par "&u="
+#                      (vide = lien direct sans commission)
+#   HW_PREFIX : wrapper affilié Hostelworld (optionnel)
 
 import os
 from urllib.parse import quote
 
 from providers.hotel_labels import hotel_label
 
-TP_MARKER = os.getenv("TP_MARKER", "")
+HOTEL_AFF_PREFIX = os.getenv("HOTEL_AFF_PREFIX", "")
 HW_PREFIX = os.getenv("HW_PREFIX", "")
 
 FACTORS = {"hotel": 0.6, "hostel": 0.35, "any": 0.5}
 MIN_PER_NIGHT = {"hotel": 25, "hostel": 15, "any": 20}
+
+def trip_url(city_en: str, checkin: str, checkout: str, adults: int) -> str:
+    target = (
+        "https://www.trip.com/hotels/list"
+        f"?searchWord={quote(city_en)}"
+        f"&checkin={checkin}&checkout={checkout}&adult={adults}"
+    )
+    if HOTEL_AFF_PREFIX:
+        return f"{HOTEL_AFF_PREFIX}{quote(target, safe='')}"
+    return target
 
 def hostelworld_url(city_en: str, checkin: str, checkout: str, guests: int) -> str:
     url = (
@@ -30,13 +45,6 @@ def build_hotel_option(city_en: str, checkin: str, checkout: str,
     if per_room_night_budget < MIN_PER_NIGHT[acc]:
         return None
     est_room_night = round(per_room_night_budget * FACTORS[acc])
-    hotellook = (
-        "https://search.hotellook.com/hotels"
-        f"?destination={quote(city_en)}"
-        f"&checkIn={checkin}&checkOut={checkout}"
-        f"&adults={travelers}&currency=eur&language={lang}"
-        f"&marker={TP_MARKER}"
-    )
     alt = None
     if acc in ("hostel", "any"):
         alt = hostelworld_url(city_en, checkin, checkout, travelers)
@@ -45,6 +53,6 @@ def build_hotel_option(city_en: str, checkin: str, checkout: str,
         "price_per_night": float(est_room_night * rooms),
         "total_price": round(est_room_night * rooms * nights, 2),
         "rating": 0,
-        "booking_url": hotellook,
+        "booking_url": trip_url(city_en, checkin, checkout, travelers),
         "alt_booking_url": alt,
     }
