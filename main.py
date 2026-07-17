@@ -11,9 +11,8 @@ from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 from providers.currency import get_rates, normalize
-from routes_hotels import router as hotels_router
 
-app = FastAPI(title="Travel2Go API - Europe", version="4.6.0")
+app = FastAPI(title="Travel2Go API - Europe", version="4.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +21,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(hotels_router)
 
 BAG_FEE_PER_TRIP = 30.0
 
@@ -205,4 +203,4 @@ async def list_destinations(lang: str = "fr"):
 
 @app.get("/")
 async def root():
-    return {"service": "Travel2Go API - Europe", "version": "4.6.0"}
+    return {"service": "Travel2Go API - Europe", "version": "4.7.0"}
