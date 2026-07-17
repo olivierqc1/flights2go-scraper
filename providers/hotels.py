@@ -1,24 +1,17 @@
-# Hébergement : estimation + deeplink Hotellook, et Hostelworld en plus
-# pour les auberges (alt_booking_url).
+# Hébergement : estimation basée sur le budget + deeplinks.
+# Hotellook toujours, Hostelworld en plus pour les auberges.
 # Env vars : TP_MARKER, HW_PREFIX (optionnel, wrapper affilié Hostelworld)
 
 import os
 from urllib.parse import quote
+
+from providers.hotel_labels import hotel_label
 
 TP_MARKER = os.getenv("TP_MARKER", "")
 HW_PREFIX = os.getenv("HW_PREFIX", "")
 
 FACTORS = {"hotel": 0.6, "hostel": 0.35, "any": 0.5}
 MIN_PER_NIGHT = {"hotel": 25, "hostel": 15, "any": 20}
-
-LABELS = {
-    "hotel": {"fr": "Hôtels disponibles", "en": "Hotels available",
-              "es": "Hoteles disponibles"},
-    "hostel": {"fr": "Auberges de jeunesse", "en": "Hostels",
-               "es": "Albergues juveniles"},
-    "any": {"fr": "Hébergements disponibles", "en": "Places to stay",
-            "es": "Alojamientos disponibles"},
-}
 
 def hostelworld_url(city_en: str, checkin: str, checkout: str, guests: int) -> str:
     url = (
@@ -37,7 +30,6 @@ def build_hotel_option(city_en: str, checkin: str, checkout: str,
     if per_room_night_budget < MIN_PER_NIGHT[acc]:
         return None
     est_room_night = round(per_room_night_budget * FACTORS[acc])
-    labels = LABELS[acc]
     hotellook = (
         "https://search.hotellook.com/hotels"
         f"?destination={quote(city_en)}"
@@ -49,7 +41,7 @@ def build_hotel_option(city_en: str, checkin: str, checkout: str,
     if acc in ("hostel", "any"):
         alt = hostelworld_url(city_en, checkin, checkout, travelers)
     return {
-        "name": labels.get(lang, labels["en"]),
+        "name": hotel_label(acc, lang),
         "price_per_night": float(est_room_night * rooms),
         "total_price": round(est_room_night * rooms * nights, 2),
         "rating": 0,
