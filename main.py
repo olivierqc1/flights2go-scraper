@@ -11,6 +11,7 @@ from providers.flights import fetch_flight
 from providers.hotels import build_hotel_option
 from providers.ground import get_ground_transport
 from providers.currency import get_rates, normalize
+from routes_hotels import router as hotels_router
 
 app = FastAPI(title="Travel2Go API - Europe", version="4.6.0")
 
