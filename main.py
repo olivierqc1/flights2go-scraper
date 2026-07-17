@@ -22,6 +22,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(hotels_router)
 
 BAG_FEE_PER_TRIP = 30.0
 
