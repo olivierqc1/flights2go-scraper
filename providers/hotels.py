@@ -1,10 +1,8 @@
 # Hébergement : estimation basée sur le budget + deeplinks.
-# Hotellook est MORT (fermé oct. 2025) -> cible Trip.com,
-# avec wrapper affilié Travelpayouts optionnel (tp.media).
-# Hostelworld pour les auberges.
+# Cible Booking.com (accepte ville en texte + dates dans l'URL).
+# Wrapper affilié optionnel via env var. Hostelworld pour les auberges.
 # Env vars :
-#   HOTEL_AFF_PREFIX : wrapper tp.media complet finissant par "&u="
-#                      (vide = lien direct sans commission)
+#   HOTEL_AFF_PREFIX : wrapper affilié finissant par "&u=" (vide = direct)
 #   HW_PREFIX : wrapper affilié Hostelworld (optionnel)
 
 import os
@@ -18,11 +16,13 @@ HW_PREFIX = os.getenv("HW_PREFIX", "")
 FACTORS = {"hotel": 0.6, "hostel": 0.35, "any": 0.5}
 MIN_PER_NIGHT = {"hotel": 25, "hostel": 15, "any": 20}
 
-def trip_url(city_en: str, checkin: str, checkout: str, adults: int) -> str:
+def booking_url(city_en: str, checkin: str, checkout: str, adults: int) -> str:
     target = (
-        "https://www.trip.com/hotels/list"
-        f"?searchWord={quote(city_en)}"
-        f"&checkin={checkin}&checkout={checkout}&adult={adults}"
+        "https://www.booking.com/searchresults.html"
+        f"?ss={quote(city_en)}"
+        f"&checkin={checkin}&checkout={checkout}"
+        f"&group_adults={adults}&no_rooms={max(1, (adults + 1) // 2)}"
+        f"&group_children=0"
     )
     if HOTEL_AFF_PREFIX:
         return f"{HOTEL_AFF_PREFIX}{quote(target, safe='')}"
@@ -53,6 +53,6 @@ def build_hotel_option(city_en: str, checkin: str, checkout: str,
         "price_per_night": float(est_room_night * rooms),
         "total_price": round(est_room_night * rooms * nights, 2),
         "rating": 0,
-        "booking_url": trip_url(city_en, checkin, checkout, travelers),
+        "booking_url": booking_url(city_en, checkin, checkout, travelers),
         "alt_booking_url": alt,
     }
